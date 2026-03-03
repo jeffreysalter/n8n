@@ -1,4 +1,12 @@
-import { CreateRoleDto, UpdateRoleDto } from '@n8n/api-types';
+import {
+	CreateRoleDto,
+	RoleAssignmentsResponseDto,
+	RoleGetQueryDto,
+	RoleListQueryDto,
+	RoleProjectMembersResponseDto,
+	UpdateRoleDto,
+} from '@n8n/api-types';
+import type { RoleAssignmentsResponse, RoleProjectMembersResponse } from '@n8n/api-types';
 import { LICENSE_FEATURES } from '@n8n/constants';
 import { AuthenticatedRequest } from '@n8n/db';
 import {
@@ -10,6 +18,7 @@ import {
 	Param,
 	Patch,
 	Post,
+	Query,
 	RestController,
 } from '@n8n/decorators';
 import { Role as RoleDTO } from '@n8n/permissions';
@@ -21,8 +30,12 @@ export class RoleController {
 	constructor(private readonly roleService: RoleService) {}
 
 	@Get('/')
-	async getAllRoles(): Promise<Record<string, RoleDTO[]>> {
-		const allRoles = await this.roleService.getAllRoles();
+	async getAllRoles(
+		_req: AuthenticatedRequest,
+		_res: Response,
+		@Query query: RoleListQueryDto,
+	): Promise<Record<string, RoleDTO[]>> {
+		const allRoles = await this.roleService.getAllRoles(query.withUsageCount);
 		return {
 			global: allRoles.filter((r) => r.roleType === 'global'),
 			project: allRoles.filter((r) => r.roleType === 'project'),
@@ -31,13 +44,37 @@ export class RoleController {
 		};
 	}
 
+	@Get('/:slug/assignments/:projectId/members')
+	@GlobalScope('role:manage')
+	async getRoleProjectMembers(
+		_req: AuthenticatedRequest,
+		_res: Response,
+		@Param('slug') slug: string,
+		@Param('projectId') projectId: string,
+	): Promise<RoleProjectMembersResponse> {
+		const result = await this.roleService.getRoleProjectMembers(slug, projectId);
+		return RoleProjectMembersResponseDto.parse(result);
+	}
+
+	@Get('/:slug/assignments')
+	@GlobalScope('role:manage')
+	async getRoleAssignments(
+		_req: AuthenticatedRequest,
+		_res: Response,
+		@Param('slug') slug: string,
+	): Promise<RoleAssignmentsResponse> {
+		const result = await this.roleService.getRoleAssignments(slug);
+		return RoleAssignmentsResponseDto.parse(result);
+	}
+
 	@Get('/:slug')
 	async getRoleBySlug(
 		_req: AuthenticatedRequest,
 		_res: Response,
 		@Param('slug') slug: string,
+		@Query query: RoleGetQueryDto,
 	): Promise<RoleDTO> {
-		return await this.roleService.getRole(slug);
+		return await this.roleService.getRole(slug, query.withUsageCount);
 	}
 
 	@Patch('/:slug')

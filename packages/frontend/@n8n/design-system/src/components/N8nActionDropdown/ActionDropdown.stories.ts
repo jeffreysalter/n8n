@@ -1,9 +1,9 @@
-import type { StoryFn } from '@storybook/vue3';
+import type { StoryFn } from '@storybook/vue3-vite';
 
 import N8nActionDropdown from './ActionDropdown.vue';
 
 export default {
-	title: 'Atoms/ActionDropdown',
+	title: 'Core/ActionDropdown',
 	component: N8nActionDropdown,
 	argTypes: {
 		placement: {
