@@ -2,7 +2,11 @@
  * Consolidated workspace tool — projects, tags, folders, execution cleanup.
  */
 import { Tool } from '@n8n/agents';
-import { instanceAiConfirmationSeveritySchema } from '@n8n/api-types';
+import {
+	folderNameSchema,
+	instanceAiApprovalResumeSchema,
+	instanceAiConfirmationSeveritySchema,
+} from '@n8n/api-types';
 import { nanoid } from 'nanoid';
 import { z } from 'zod';
 
@@ -48,7 +52,9 @@ const cleanupTestExecutionsAction = z.object({
 	olderThanHours: z
 		.number()
 		.optional()
-		.describe('Only delete executions older than this many hours. Defaults to 1.'),
+		.describe(
+			'Only delete executions older than this many hours. Must be greater than 0. Defaults to 1.',
+		),
 });
 
 const listFoldersAction = z.object({
@@ -58,7 +64,7 @@ const listFoldersAction = z.object({
 
 const createFolderAction = z.object({
 	action: z.literal('create-folder').describe('Create a new folder in a project'),
-	name: z.string().describe('Name for the new folder'),
+	name: folderNameSchema.describe('Name for the new folder'),
 	projectId: projectIdField,
 	parentFolderId: z
 		.string()
@@ -99,9 +105,7 @@ const suspendSchema = z.object({
 	severity: instanceAiConfirmationSeveritySchema,
 });
 
-const resumeSchema = z.object({
-	approved: z.boolean(),
-});
+const resumeSchema = instanceAiApprovalResumeSchema;
 
 // ── Input union ─────────────────────────────────────────────────────────────
 
@@ -142,7 +146,17 @@ interface WorkspaceToolContext {
 
 async function handleListProjects(context: InstanceAiContext) {
 	const projects = await context.workspaceService!.listProjects();
-	return { projects };
+	// Flag the conversation's own project here rather than naming it in the system
+	// prompt: the prompt is a shared prompt-cache prefix, a tool result is not.
+	const boundProjectId = context.projectId;
+	if (boundProjectId === undefined) return { projects };
+
+	return {
+		projects: projects.map((project) => ({
+			...project,
+			...(project.id === boundProjectId ? { isCurrentProject: true } : {}),
+		})),
+	};
 }
 
 async function handleListTags(context: InstanceAiContext) {
@@ -193,6 +207,15 @@ async function handleCleanupTestExecutions(
 		return { deletedCount: 0, denied: true, reason: 'Action blocked by admin' };
 	}
 
+	// Checked here, not in the schema: the flattened action schema would apply the bound to every
+	// action. OpenAI strict tool calls must fill this field, and 0 would delete every test execution.
+	if (input.olderThanHours !== undefined && !(input.olderThanHours > 0)) {
+		return {
+			error:
+				'Nothing was deleted: olderThanHours must be greater than 0. Pass 1 to delete executions older than 1 hour.',
+		};
+	}
+
 	const needsApproval = context.permissions?.cleanupTestExecutions !== 'always_allow';
 
 	// State 1: First call — suspend for confirmation (unless always_allow)
@@ -232,6 +255,16 @@ async function handleCreateFolder(
 ) {
 	const { resumeData } = ctx;
 
+	// The provider-facing schema strips `folderNameSchema`'s refinement (MCP tool
+	// schemas can't express custom validators), so the real check runs here — a
+	// slash in the name would make a workflow's folder `path` indistinguishable
+	// from real nesting.
+	const nameCheck = folderNameSchema.safeParse(input.name);
+	if (!nameCheck.success) {
+		return { error: nameCheck.error.issues[0]?.message ?? 'Invalid folder name' };
+	}
+	const name = nameCheck.data;
+
 	if (context.permissions?.createFolder === 'blocked') {
 		return {
 			id: '',
@@ -248,7 +281,7 @@ async function handleCreateFolder(
 	if (needsApproval && (resumeData === undefined || resumeData === null)) {
 		return await ctx.suspend({
 			requestId: nanoid(),
-			message: `Create ${input.name} in project ${input.projectId}`,
+			message: `Create ${name} in project ${input.projectId}`,
 			severity: 'info' as const,
 		});
 	}
@@ -266,7 +299,7 @@ async function handleCreateFolder(
 
 	// State 3: Approved or always_allow — execute
 	const folder = await context.workspaceService!.createFolder!(
-		input.name,
+		name,
 		input.projectId,
 		input.parentFolderId,
 	);

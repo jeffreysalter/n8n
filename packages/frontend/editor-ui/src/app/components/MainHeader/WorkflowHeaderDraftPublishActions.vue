@@ -19,7 +19,7 @@ import {
 	N8nSpinner,
 	N8nTooltip,
 } from '@n8n/design-system';
-import { useI18n } from '@n8n/i18n';
+import { type BaseTextKey, useI18n } from '@n8n/i18n';
 import { useUIStore } from '@/app/stores/ui.store';
 import { useSettingsStore } from '@n8n/stores/settings.store';
 import { getActivatableTriggerNodes } from '@/app/utils/nodeTypesUtils';
@@ -38,6 +38,10 @@ import { ProjectTypes } from '@/features/collaboration/projects/projects.types';
 import { useProjectsStore } from '@/features/collaboration/projects/projects.store';
 import { useWorkflowActivate } from '@/app/composables/useWorkflowActivate';
 import { useToast } from '@n8n/composables/useToast';
+import {
+	describeNodeTypeRestriction,
+	getNodeTypeRestriction,
+} from '@n8n/frontend-module-type-availability-policies';
 import { createEventBus } from '@n8n/utils/event-bus';
 import type { WorkflowVersionFormModalEventBusEvents } from '@/features/workflows/workflowHistory/components/WorkflowVersionFormModal.vue';
 import { useWorkflowHistoryStore } from '@/features/workflows/workflowHistory/workflowHistory.store';
@@ -47,6 +51,7 @@ import {
 	createWorkflowDocumentId,
 } from '@/app/stores/workflowDocument.store';
 import { useWorkflowPublicationStatusSync } from '@/app/composables/useWorkflowPublicationStatusSync';
+import { useUnusableWorkflowCredentials } from '@/features/credentials/composables/useUnusableWorkflowCredentials';
 import { useWorkflowReviewsFeature } from '@/features/workflow-reviews/composables/useWorkflowReviewsFeature';
 import WorkflowReviewRequiredToggle from '@/features/workflow-reviews/components/WorkflowReviewRequiredToggle.vue';
 import WorkflowPublishChoiceDialog from '@/features/workflow-reviews/components/WorkflowPublishChoiceDialog.vue';
@@ -78,6 +83,11 @@ const workflowDocumentStore = computed(() =>
 // Pass a getter so the composable re-syncs internally when the user navigates
 // to a different workflow without this component being remounted.
 useWorkflowPublicationStatusSync(() => workflowDocumentStore.value.documentId);
+
+const { reason: unusableCredentialReason } = useUnusableWorkflowCredentials(
+	() => workflowDocumentStore.value.usedCredentials,
+	() => workflowDocumentStore.value.allNodes,
+);
 const { refetch: refetchReviewStatus } = useWorkflowReviewStatusSync(() =>
 	props.isNewWorkflow ? undefined : props.id,
 );
@@ -111,8 +121,21 @@ const showWorkflowReviewControls = computed(
 
 const latestReviewRequest = computed(() => reviewStatusStore.latestReviewRequest(props.id));
 
+const openReviewRequest = computed(() => reviewStatusStore.openReviewRequest(props.id));
+
 /** Saved version of the working copy — what a review is pinned to, or diverges from. */
 const savedVersionId = computed(() => workflowDocumentStore.value.versionId || undefined);
+
+/** Whether the open review already contains the current saved workflow version. */
+const reviewContainsSavedVersion = computed(() => {
+	const reviewVersionId = openReviewRequest.value?.workflowVersionId;
+	return !!reviewVersionId && reviewVersionId === savedVersionId.value;
+});
+
+/** Unsaved workflow edits can still produce a new version when Publish saves first. */
+const isReviewUpdateBlocked = computed(
+	() => reviewContainsSavedVersion.value && !uiStore.hasUnsavedWorkflowChanges,
+);
 
 const autoSaveForPublish = ref(false);
 const isSaving = ref(false);
@@ -121,7 +144,6 @@ const showSubmitForReviewDialog = ref(false);
 const showReviewSubmittedDialog = ref(false);
 const submittedReviewRequestId = ref<string>();
 const showUpdateReviewDialog = ref(false);
-const isRetryingPublish = ref(false);
 
 watch(
 	() => props.id,
@@ -154,11 +176,29 @@ const containsTrigger = computed((): boolean => {
 	return foundTriggers.value.length > 0;
 });
 
-const nodesWithValidationIssues = computed(
-	() => workflowDocumentStore.value.nodesWithValidationIssues,
-);
+// The nodes that actually block publishing, so the count in the message matches
+// why the button is disabled.
+const nodesWithValidationIssues = computed(() => workflowDocumentStore.value.publishBlockingNodes);
 
 const hasNodeIssues = computed(() => workflowDocumentStore.value.hasPublishBlockingIssues);
+
+const isWorkflowPublishable = computed(() => containsTrigger.value && !hasNodeIssues.value);
+
+/** Why publishing is blocked, or '' when it is not. Also the Publish tooltip. */
+const publishBlockedReason = computed(() => {
+	if (isWorkflowPublishable.value) return '';
+	if (!containsTrigger.value) return i18n.baseText('workflows.publishModal.noTriggerMessage');
+
+	for (const node of nodesWithValidationIssues.value) {
+		const restriction = getNodeTypeRestriction(node.type);
+		if (restriction) return describeNodeTypeRestriction(node.name, restriction.scope, 'replace');
+	}
+
+	return i18n.baseText('workflowActivator.showMessage.activeChangedNodesIssuesExistTrue.title', {
+		interpolate: { count: nodesWithValidationIssues.value.length },
+		adjustToNumber: nodesWithValidationIssues.value.length,
+	});
+});
 
 type WorkflowPublishState =
 	| 'not-published-not-eligible' // No trigger nodes or has errors
@@ -190,8 +230,7 @@ const workflowPublishState = computed((): WorkflowPublishState => {
 
 	// Not published states
 	if (!hasBeenPublished) {
-		const canPublish = containsTrigger.value && !hasNodeIssues.value;
-		return canPublish ? 'not-published-eligible' : 'not-published-not-eligible';
+		return isWorkflowPublishable.value ? 'not-published-eligible' : 'not-published-not-eligible';
 	}
 
 	// Published states
@@ -214,14 +253,22 @@ const hasUnpublishPermission = computed(() => props.workflowPermissions.unpublis
 const isPersonalSpace = computed(() => projectStore.currentProject?.type === ProjectTypes.Personal);
 
 /**
- * Submitting changes and retrying a publish both need publish rights and write
- * access. An archived workflow keeps the status readable but rejects both writes.
+ * Submitting changes needs publish rights and write access. An archived workflow
+ * keeps the status readable but rejects writes. It also clears the same
+ * publishability bar as the Publish button, so the two cannot drift apart.
  */
 const canActOnReview = computed(
-	() => !!hasPublishPermission.value && !collaborationReadOnly.value && !props.isArchived,
+	() =>
+		!!hasPublishPermission.value &&
+		!collaborationReadOnly.value &&
+		!props.isArchived &&
+		isWorkflowPublishable.value,
 );
 
-const canOpenReview = computed(() => !!hasPublishPermission.value);
+// Backend-computed involvement rule (admin, author, or assigned reviewer):
+// publish permission alone no longer opens a review, and a link the detail
+// endpoint would 404 must not render.
+const canOpenReview = computed(() => latestReviewRequest.value?.viewerCanOpen ?? false);
 
 /**
  * Cancel autosave if scheduled or wait for it to finish if in progress
@@ -270,23 +317,38 @@ const flushSaveForReview = async (): Promise<string | undefined> => {
 	return workflowDocumentStore.value.versionId || undefined;
 };
 
+const showReviewToast = (titleKey: BaseTextKey, reviewRequestId: string) => {
+	const reviewRoute = {
+		name: WORKFLOW_REVIEW_REQUESTS_VIEW,
+		params: { reviewId: reviewRequestId },
+	};
+	const reviewUrl = router.resolve(reviewRoute).href;
+
+	toast.showToast({
+		type: 'success',
+		title: i18n.baseText(titleKey),
+		message: `<a href="${reviewUrl}">${i18n.baseText('workflowReviews.editorBanner.openReview')}</a>`,
+		onClick: (event: MouseEvent | undefined) => {
+			if (!(event?.target instanceof HTMLAnchorElement)) return;
+			if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return; // let the browser open a new tab
+
+			event.preventDefault();
+			void router.push(reviewRoute);
+		},
+	});
+};
+
 const onReviewSubmitted = (workflowReviewRequestId: string) => {
 	submittedReviewRequestId.value = workflowReviewRequestId;
-	toast.showMessage({
-		type: 'success',
-		title: i18n.baseText('workflowReviews.submitted.toast'),
-	});
+	showReviewToast('workflowReviews.submitted.title', workflowReviewRequestId);
 
 	if (!submittedDialogDismissed.value) {
 		showReviewSubmittedDialog.value = true;
 	}
 };
 
-const onReviewUpdated = () => {
-	toast.showMessage({
-		type: 'success',
-		title: i18n.baseText('workflowReviews.updateReview.toast'),
-	});
+const onReviewUpdated = (workflowReviewRequestId: string) => {
+	showReviewToast('workflowReviews.updateReview.toast', workflowReviewRequestId);
 };
 
 /** The submit dialog hit a 409: an open review exists, so offer updating it instead. */
@@ -301,6 +363,7 @@ const onReviewConflict = () => {
  */
 const onSubmitChangesFromBanner = async () => {
 	if (!(await ensureWorkflowSaved())) return;
+	if (reviewContainsSavedVersion.value) return;
 	showUpdateReviewDialog.value = true;
 };
 
@@ -310,7 +373,7 @@ const onOpenReviewFromBanner = async () => {
 
 	await router.push({
 		name: WORKFLOW_REVIEW_REQUESTS_VIEW,
-		params: { reviewRequestId: review.id },
+		params: { reviewId: review.id },
 		// The inbox opens on its "Open" tab, so a closed review would land in a list
 		// that cannot contain its card. Keyed off the review's own state rather than
 		// an approved decision, so any way a review gets closed still lands right.
@@ -319,30 +382,13 @@ const onOpenReviewFromBanner = async () => {
 	});
 };
 
-/**
- * Publish the approved pinned version — not the working copy, which may already
- * have moved on and was never reviewed.
- */
-const onRetryPublishFromBanner = async () => {
-	const pinnedVersionId = latestReviewRequest.value?.workflowVersionId;
-	if (!pinnedVersionId || isRetryingPublish.value) return;
-
-	isRetryingPublish.value = true;
-	try {
-		// Errors are surfaced by the shared activation error handling; the banner
-		// stays put because the review status is unchanged on failure.
-		const { success } = await workflowActivate.publishWorkflow(props.id, pinnedVersionId);
-		if (success) {
-			// The active-version watcher covers the usual case, but a retry that
-			// lands on an unchanged active version must still clear the banner.
-			await refetchReviewStatus();
-		}
-	} finally {
-		isRetryingPublish.value = false;
-	}
-};
-
 const onPublishButtonClick = async () => {
+	// Event-bus callers skip the disabled button, so show the reason as a toast.
+	if (unusableCredentialReason.value) {
+		toast.showMessage({ title: unusableCredentialReason.value, type: 'warning' });
+		return;
+	}
+
 	if (!(await ensureWorkflowSaved())) return;
 
 	if (isWorkflowReviewsEnabled.value) {
@@ -351,6 +397,7 @@ const onPublishButtonClick = async () => {
 		// on-mount fetch resolves) reads as "no open review" — accepted, since
 		// only backend enforcement can close that hole.
 		if (reviewStatusStore.hasOpenReview(props.id)) {
+			if (reviewContainsSavedVersion.value) return;
 			showUpdateReviewDialog.value = true;
 			return;
 		}
@@ -371,6 +418,19 @@ const onPublishButtonClick = async () => {
 };
 
 const publishButtonConfig = computed(() => {
+	// Published workflows run as the publisher, so check credentials before permissions.
+	if (unusableCredentialReason.value) {
+		return {
+			text: i18n.baseText('workflows.publish'),
+			enabled: false,
+			loading: false,
+			showIndicator: !!activeVersion.value,
+			indicatorClass: activeVersion.value ? 'published' : '',
+			tooltip: unusableCredentialReason.value,
+			showVersionInfo: !!activeVersion.value,
+		};
+	}
+
 	// Handle permission-denied state first
 	if (!hasPublishPermission.value) {
 		const defaultConfigForNoPermission = {
@@ -401,18 +461,11 @@ const publishButtonConfig = computed(() => {
 	if (props.isNewWorkflow) {
 		return {
 			text: i18n.baseText('workflows.publish'),
-			enabled: containsTrigger.value && !hasNodeIssues.value,
+			enabled: isWorkflowPublishable.value,
 			loading: false,
 			showIndicator: false,
 			indicatorClass: '',
-			tooltip: !containsTrigger.value
-				? i18n.baseText('workflows.publishModal.noTriggerMessage')
-				: hasNodeIssues.value
-					? i18n.baseText('workflowActivator.showMessage.activeChangedNodesIssuesExistTrue.title', {
-							interpolate: { count: nodesWithValidationIssues.value.length },
-							adjustToNumber: nodesWithValidationIssues.value.length,
-						})
-					: '',
+			tooltip: publishBlockedReason.value,
 			showVersionInfo: false,
 		};
 	}
@@ -425,12 +478,7 @@ const publishButtonConfig = computed(() => {
 			loading: false,
 			showIndicator: false,
 			indicatorClass: '',
-			tooltip: !containsTrigger.value
-				? i18n.baseText('workflows.publishModal.noTriggerMessage')
-				: i18n.baseText('workflowActivator.showMessage.activeChangedNodesIssuesExistTrue.title', {
-						interpolate: { count: nodesWithValidationIssues.value.length },
-						adjustToNumber: nodesWithValidationIssues.value.length,
-					}),
+			tooltip: publishBlockedReason.value,
 			showVersionInfo: false,
 		},
 		'not-published-eligible': {
@@ -466,13 +514,7 @@ const publishButtonConfig = computed(() => {
 			loading: false,
 			showIndicator: true,
 			indicatorClass: 'error',
-			tooltip: i18n.baseText(
-				'workflowActivator.showMessage.activeChangedNodesIssuesExistTrue.title',
-				{
-					interpolate: { count: nodesWithValidationIssues.value.length },
-					adjustToNumber: nodesWithValidationIssues.value.length,
-				},
-			),
+			tooltip: publishBlockedReason.value,
 			showVersionInfo: true,
 		},
 		'published-invalid-trigger': {
@@ -495,7 +537,7 @@ const publishButtonConfig = computed(() => {
 		},
 		'publication-partial': {
 			text: i18n.baseText('workflows.publish'),
-			enabled: true,
+			enabled: isWorkflowPublishable.value,
 			loading: false,
 			showIndicator: true,
 			indicatorClass: 'partial',
@@ -504,7 +546,7 @@ const publishButtonConfig = computed(() => {
 		},
 		'publication-failed': {
 			text: i18n.baseText('workflows.publish'),
-			enabled: true,
+			enabled: isWorkflowPublishable.value,
 			loading: false,
 			showIndicator: true,
 			indicatorClass: 'error',
@@ -526,7 +568,24 @@ const shouldDisablePublishButton = computed(() => {
 		props.isNewWorkflow ||
 		collaborationReadOnly.value ||
 		!publishButtonConfig.value.enabled ||
-		!hasPublishPermission.value
+		!hasPublishPermission.value ||
+		(isWorkflowReviewsEnabled.value && isReviewUpdateBlocked.value)
+	);
+});
+
+/**
+ * A workflow that is ready to publish has nothing to explain, so the tooltip
+ * stays off. A credential this user cannot use is the exception: the button is
+ * disabled in that state too, and the reason is the only way to learn why.
+ */
+const isPublishTooltipDisabled = computed(() => {
+	if (unusableCredentialReason.value) return false;
+
+	return (
+		(workflowPublishState.value === 'not-published-eligible' &&
+			props.workflowPermissions.publish) ||
+		(!publishButtonConfig.value.tooltip &&
+			!(publishButtonConfig.value.showVersionInfo && activeVersion.value))
 	);
 });
 
@@ -691,6 +750,7 @@ const onUnpublish = () => {
 	uiStore.openModalWithData({
 		name: WORKFLOW_HISTORY_VERSION_UNPUBLISH,
 		data: {
+			workflowId: props.id,
 			versionName: activeVersion.value.name,
 			eventBus: unpublishEventBus,
 		},
@@ -773,26 +833,15 @@ onBeforeUnmount(() => {
 				:review="latestReviewRequest"
 				:saved-version-id="savedVersionId"
 				:can-submit-changes="canActOnReview"
-				:can-retry-publish="canActOnReview"
+				:submit-blocked-reason="publishBlockedReason"
 				:can-open-review="canOpenReview"
-				:is-publishing="isRetryingPublish"
 				@open-review="onOpenReviewFromBanner"
 				@submit-changes="onSubmitChangesFromBanner"
-				@retry-publish="onRetryPublishFromBanner"
 			/>
 		</div>
 		<div v-if="!shouldHidePublishButton" :class="$style.publishButtonWrapper">
 			<div :class="$style.buttonGroup">
-				<N8nTooltip
-					:disabled="
-						(workflowPublishState === 'not-published-eligible' &&
-							props.workflowPermissions.publish) ||
-						(!publishButtonConfig.tooltip &&
-							!(publishButtonConfig.showVersionInfo && activeVersion))
-					"
-					:show-after="300"
-					:offset="15"
-				>
+				<N8nTooltip :disabled="isPublishTooltipDisabled" :show-after="300" :offset="15">
 					<template #content>
 						<div>
 							<template v-if="publishButtonConfig.tooltip">
@@ -893,6 +942,7 @@ onBeforeUnmount(() => {
 				v-model:open="showUpdateReviewDialog"
 				:workflow-id="props.id"
 				:flush-save="flushSaveForReview"
+				:can-submit="!isReviewUpdateBlocked"
 				@updated="onReviewUpdated"
 			/>
 		</template>
@@ -933,7 +983,7 @@ onBeforeUnmount(() => {
 .buttonGroup {
 	display: inline-flex;
 	border: var(--border);
-	border-radius: var(--radius--3xs);
+	border-radius: var(--radius--full);
 }
 
 .groupButtonLeft,

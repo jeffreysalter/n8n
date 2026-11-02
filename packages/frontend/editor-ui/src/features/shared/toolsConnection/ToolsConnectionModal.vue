@@ -8,22 +8,30 @@ import {
 	N8nTabs,
 	N8nText,
 } from '@n8n/design-system';
-import type { TabOptions } from '@n8n/design-system';
+import type { DialogSize, TabOptions } from '@n8n/design-system';
 import { type BaseTextKey, useI18n } from '@n8n/i18n';
 import { useDebounceFn } from '@vueuse/core';
+import { partitionLast } from '@n8n/utils/sort/partition-last';
 import { getDebounceTime } from '@n8n/composables/useDebounce';
 import { DEBOUNCE_TIME } from '@/app/constants/durations';
-
 import ToolRow from './ToolRow.vue';
 import ToolDetailView from './ToolDetailView.vue';
 import ToolSettingsView from './ToolSettingsView.vue';
 import {
 	CATEGORY_BY_KIND,
+	hasToolConnection,
 	type FlattenedRow,
 	type ToolCategoryKey,
 	type ToolConnectionItem,
 	type ToolConnectionSettings,
 } from './types';
+
+type PickerCreateAction = {
+	category?: ToolCategoryKey;
+	label: string;
+	description?: string;
+	testId?: string;
+};
 
 const props = withDefaults(
 	defineProps<{
@@ -31,14 +39,47 @@ const props = withDefaults(
 		items: ToolConnectionItem[];
 		/** Tabs to render, in order. Declared categories show even while empty. */
 		categories: ToolCategoryKey[];
+		title?: string;
+		searchPlaceholder?: string;
 		detailItem?: ToolConnectionItem | null;
 		detailMode?: 'detail' | 'settings';
 		hideBackButton?: boolean;
+		/** Dialog width. Consumers with more tabs (e.g. the n8n Connect section) can widen it. */
+		size?: DialogSize;
+		showSuggestionFooter?: boolean;
+		createAction?: PickerCreateAction;
+		createActionLoading?: boolean;
+		/** Replace the body with a loading screen, e.g. until the consumer has credentials to match rows against. */
+		loading?: boolean;
+		emptyMessage?: string;
+		noResultsMessage?: string;
+		/** Render only the modal body when an owning feature supplies the dialog shell. */
+		embedded?: boolean;
+		showConnectActions?: boolean;
+		/** Show matches from all categories under category headings while searching. */
+		groupSearchResults?: boolean;
+		/** Keep the list scrollbar visible instead of revealing it on hover. */
+		persistentScrollbar?: boolean;
+		connectLabel?: (item: ToolConnectionItem) => string;
+		connectAriaLabel?: (item: ToolConnectionItem) => string;
+		connectedLabel?: (item: ToolConnectionItem) => string;
+		categoryLabels?: Partial<Record<ToolCategoryKey, string>>;
 	}>(),
 	{
 		open: false,
 		detailItem: null,
 		detailMode: 'detail',
+		size: 'xlarge',
+		showSuggestionFooter: false,
+		createAction: undefined,
+		createActionLoading: false,
+		loading: false,
+		emptyMessage: undefined,
+		noResultsMessage: undefined,
+		embedded: false,
+		showConnectActions: false,
+		groupSearchResults: false,
+		persistentScrollbar: false,
 	},
 );
 
@@ -54,9 +95,26 @@ const emit = defineEmits<{
 	'new-credential-connect': [item: ToolConnectionItem];
 	'open-detail': [item: ToolConnectionItem];
 	connect: [item: ToolConnectionItem];
+	create: [category: ToolCategoryKey];
 }>();
 
 const i18n = useI18n();
+const modalTitle = computed(() => props.title ?? i18n.baseText('tools.connection.title'));
+const containerComponent = computed(() => (props.embedded ? 'div' : N8nDialog));
+const containerProps = computed(() =>
+	props.embedded
+		? {}
+		: {
+				open: props.open,
+				size: props.size,
+				header: props.detailItem ? '' : modalTitle.value,
+				showCloseButton: !props.detailItem,
+				'aria-label': modalTitle.value,
+			},
+);
+const searchPlaceholder = computed(
+	() => props.searchPlaceholder ?? i18n.baseText('tools.connection.search.placeholder'),
+);
 
 const ITEM_HEIGHT = 58;
 
@@ -71,6 +129,7 @@ watch(searchQuery, (value) => {
 });
 
 const activeCategory = ref<ToolCategoryKey>(props.categories[0] ?? 'connected');
+const isMcpCategory = computed(() => activeCategory.value === 'mcp');
 
 const searchInputRef = useTemplateRef('searchInputRef');
 const scrollerRef = useTemplateRef('scrollerRef');
@@ -108,11 +167,21 @@ onMounted(() => {
 	}
 });
 
-const hasActiveSearch = computed(() => debouncedSearchQuery.value.length > 0);
+watch(
+	() => props.loading,
+	(isLoading) => {
+		// The search input is not rendered while loading.
+		if (!isLoading && props.open) focusSearchInput();
+	},
+);
+
+const normalizedSearchQuery = computed(() => debouncedSearchQuery.value.trim());
+const hasActiveSearch = computed(() => normalizedSearchQuery.value.length > 0);
+const isGroupedSearch = computed(() => props.groupSearchResults && hasActiveSearch.value);
 
 function matchesQuery(item: ToolConnectionItem): boolean {
-	if (!debouncedSearchQuery.value) return true;
-	const query = debouncedSearchQuery.value.toLowerCase();
+	if (!normalizedSearchQuery.value) return true;
+	const query = normalizedSearchQuery.value.toLowerCase();
 	return (
 		item.title.toLowerCase().includes(query) ||
 		(item.description ?? '').toLowerCase().includes(query)
@@ -125,11 +194,28 @@ function categoryOf(item: ToolConnectionItem): ToolCategoryKey {
 	return item.category ?? CATEGORY_BY_KIND[item.kind];
 }
 
+/**
+ * "All" ranks connected tools first, then those backed by n8n credits, then the
+ * rest — so the most immediately usable tools sit on top. Lower rank sorts first.
+ */
+function allSortRank(item: ToolConnectionItem): number {
+	if (hasToolConnection(item.status)) return 0;
+	if (item.freeCredits) return 1;
+	return 2;
+}
+
+function isRestrictedItem(item: ToolConnectionItem): boolean {
+	return item.kind === 'node' && item.restriction !== undefined;
+}
+
 function itemsForCategory(category: ToolCategoryKey): ToolConnectionItem[] {
-	if (category === 'all') return props.items;
-	if (category === 'connected') return props.items.filter((item) => item.isConnected);
+	// Stable sort keeps each bucket in its original order (Array.sort is stable).
+	if (category === 'all') return [...props.items].sort((a, b) => allSortRank(a) - allSortRank(b));
+	if (category === 'connected') return props.items.filter((item) => hasToolConnection(item.status));
 	return props.items.filter(
-		(item) => categoryOf(item) === category && (hasConnectedTab.value ? !item.isConnected : true),
+		(item) =>
+			categoryOf(item) === category &&
+			(hasConnectedTab.value ? !hasToolConnection(item.status) : true),
 	);
 }
 
@@ -154,10 +240,16 @@ function tabCount(category: ToolCategoryKey): string {
 	return count > MAX_DISPLAYED_COUNT ? `${MAX_DISPLAYED_COUNT}+` : String(count);
 }
 
-const flattenedRows = computed<FlattenedRow[]>(() =>
-	itemsForCategory(activeCategory.value)
-		.filter(matchesQuery)
-		.map((item) => ({ key: `item:${item.id}`, item })),
+type CategoryListRow = {
+	key: `category:${ToolCategoryKey}`;
+	category: ToolCategoryKey;
+};
+type ListRow = FlattenedRow | CategoryListRow | { key: 'suggestion' };
+
+const toolRows = computed<FlattenedRow[]>(() =>
+	partitionLast(itemsForCategory(activeCategory.value).filter(matchesQuery), isRestrictedItem).map(
+		(item) => ({ key: `item:${item.id}`, item }),
+	),
 );
 
 /** Categories only worth a tab once they hold something. */
@@ -192,16 +284,39 @@ const CATEGORY_I18N: Record<ToolCategoryKey, BaseTextKey> = {
 	mcp: 'tools.connection.categories.mcp',
 	ai: 'tools.connection.categories.ai',
 	n8n: 'tools.connection.categories.n8n',
+	'n8n-connect': 'tools.connection.categories.n8nConnect',
 	'app-action': 'tools.connection.categories.appAction',
 	community: 'tools.connection.categories.community',
 	workflows: 'tools.connection.categories.workflows',
 	agents: 'tools.connection.categories.agents',
+	project: 'tools.connection.categories.project',
+	'this-agent': 'tools.connection.categories.thisAgent',
+	global: 'tools.connection.categories.global',
 	data: 'tools.connection.categories.data',
 };
 
 function categoryLabel(category: ToolCategoryKey): string {
-	return i18n.baseText(CATEGORY_I18N[category]);
+	return props.categoryLabels?.[category] ?? i18n.baseText(CATEGORY_I18N[category]);
 }
+
+const groupedSearchRows = computed<ListRow[]>(() => {
+	const rows: ListRow[] = [];
+	for (const category of visibleCategories.value) {
+		if (category === 'all') continue;
+		const matches = itemsForCategory(category).filter(matchesQuery);
+		if (matches.length === 0) continue;
+		rows.push({ key: `category:${category}`, category } satisfies CategoryListRow);
+		rows.push(...matches.map((item) => ({ key: `item:${item.id}`, item })));
+	}
+	return rows;
+});
+
+const flattenedRows = computed<ListRow[]>(() => {
+	if (isGroupedSearch.value) return groupedSearchRows.value;
+	return isMcpCategory.value || props.showSuggestionFooter
+		? [...toolRows.value, { key: 'suggestion' }]
+		: toolRows.value;
+});
 
 /**
  * The count rides in the label rather than `tag`, which would render a chip per
@@ -223,15 +338,24 @@ watch(visibleCategories, (categories) => {
 	}
 });
 
-const isListEmpty = computed(() => flattenedRows.value.length === 0);
-const emptyMessage = computed(() => {
+const isListEmpty = computed(() =>
+	isGroupedSearch.value ? groupedSearchRows.value.length === 0 : toolRows.value.length === 0,
+);
+const resolvedEmptyMessage = computed(() => {
 	if (hasActiveSearch.value) {
+		if (props.noResultsMessage) return props.noResultsMessage;
 		return i18n.baseText('tools.connection.empty.noResults', {
-			interpolate: { query: debouncedSearchQuery.value },
+			interpolate: { query: normalizedSearchQuery.value },
 		});
 	}
-	return i18n.baseText('tools.connection.empty.title');
+	return props.emptyMessage ?? i18n.baseText('tools.connection.empty.title');
 });
+const showCreateAction = computed(
+	() =>
+		props.createAction !== undefined &&
+		(props.createAction.category === undefined ||
+			props.createAction.category === activeCategory.value),
+);
 
 function openDetail(item: ToolConnectionItem) {
 	emit('open-detail', item);
@@ -251,16 +375,24 @@ function handleOpenChange(value: boolean) {
 </script>
 
 <template>
-	<N8nDialog
-		:open="open"
-		size="xlarge"
-		:header="detailItem ? '' : i18n.baseText('tools.connection.title')"
-		:show-close-button="!detailItem"
-		:aria-label="i18n.baseText('tools.connection.title')"
+	<component
+		:is="containerComponent"
+		v-bind="containerProps"
+		:class="props.embedded && $style.embedded"
 		data-test-id="tools-connection-modal"
 		@update:open="handleOpenChange"
 	>
-		<div :class="$style.body">
+		<div
+			v-if="loading"
+			:class="[$style.body, $style.loading]"
+			role="status"
+			:aria-label="i18n.baseText('generic.loading')"
+			data-test-id="tools-connection-loading"
+		>
+			<N8nIcon icon="loader-circle" size="xlarge" spin />
+			<N8nText color="text-light">{{ i18n.baseText('generic.loading') }}</N8nText>
+		</div>
+		<div v-else :class="$style.body">
 			<ToolSettingsView
 				v-if="detailItem && detailMode === 'settings'"
 				:key="detailItem.id"
@@ -302,7 +434,7 @@ function handleOpenChange(value: boolean) {
 				<N8nInput
 					ref="searchInputRef"
 					v-model="searchQuery"
-					:placeholder="i18n.baseText('tools.connection.search.placeholder')"
+					:placeholder="searchPlaceholder"
 					clearable
 					data-test-id="tools-connection-search"
 					:class="$style.searchInput"
@@ -313,7 +445,7 @@ function handleOpenChange(value: boolean) {
 				</N8nInput>
 
 				<N8nTabs
-					v-if="tabsVisible"
+					v-if="tabsVisible && !isGroupedSearch"
 					:model-value="activeCategory"
 					:options="tabOptions"
 					size="small"
@@ -324,22 +456,69 @@ function handleOpenChange(value: boolean) {
 					@update:model-value="selectCategory"
 				/>
 
-				<div v-if="isListEmpty" :class="$style.empty" data-test-id="tools-connection-empty">
-					<N8nText color="text-light">{{ emptyMessage }}</N8nText>
-				</div>
-				<div v-else :class="$style.listWrapper">
+				<button
+					v-if="showCreateAction && createAction"
+					type="button"
+					:class="$style.createRow"
+					:disabled="createActionLoading"
+					:aria-busy="createActionLoading"
+					:data-test-id="createAction.testId ?? 'tools-connection-create'"
+					@click="emit('create', activeCategory)"
+				>
+					<span :class="$style.createIcon" aria-hidden="true">
+						<N8nIcon
+							:icon="createActionLoading ? 'loader-circle' : 'plus'"
+							:size="20"
+							:spin="createActionLoading"
+						/>
+					</span>
+					<span :class="$style.createText">
+						<N8nText tag="span" bold>
+							{{ createAction.label }}
+						</N8nText>
+						<N8nText v-if="createAction.description" tag="span" size="small" color="text-light">
+							{{ createAction.description }}
+						</N8nText>
+					</span>
+				</button>
+
+				<div :class="$style.listWrapper">
+					<template v-if="isListEmpty">
+						<div :class="$style.empty" data-test-id="tools-connection-empty">
+							<N8nText color="text-light">{{ resolvedEmptyMessage }}</N8nText>
+						</div>
+						<div v-if="isMcpCategory || showSuggestionFooter" :class="$style.suggestionRow">
+							<slot name="suggestion-footer" />
+						</div>
+					</template>
 					<N8nRecycleScroller
+						v-else
 						ref="scrollerRef"
 						:items="flattenedRows"
 						:item-size="ITEM_HEIGHT"
 						item-key="key"
-						:class="$style.scroller"
+						:class="[$style.scroller, persistentScrollbar && $style.persistentScrollbar]"
 					>
 						<template #default="{ item: row }">
+							<div
+								v-if="'category' in row"
+								:class="$style.categoryHeader"
+								:data-test-id="`tools-connection-search-category-${row.category}`"
+							>
+								<N8nText tag="h3" size="small" bold color="text-light">
+									{{ categoryLabel(row.category) }}
+								</N8nText>
+							</div>
 							<ToolRow
+								v-else-if="'item' in row"
 								:item="row.item"
+								:show-connect-action="props.showConnectActions"
+								:connect-label="props.connectLabel?.(row.item)"
+								:connect-aria-label="props.connectAriaLabel?.(row.item)"
+								:connected-label="props.connectedLabel?.(row.item)"
 								@open-detail="openDetail($event)"
 								@connect="emit('connect', $event)"
+								@disconnect="emit('disconnect', $event)"
 								@select-credential="
 									(item, authType, credentialId) =>
 										emit('select-credential', item, authType, credentialId)
@@ -348,21 +527,47 @@ function handleOpenChange(value: boolean) {
 								@first-credential-connect="emit('first-credential-connect', $event)"
 								@new-credential-connect="emit('new-credential-connect', $event)"
 							/>
+							<div v-else :class="$style.suggestionRow">
+								<slot name="suggestion-footer" />
+							</div>
 						</template>
 					</N8nRecycleScroller>
 				</div>
 			</template>
 		</div>
-	</N8nDialog>
+	</component>
 </template>
 
 <style lang="scss" module>
+@use '@n8n/design-system/css/mixins/mixins' as scrollbar-mixins;
+
 .body {
 	display: flex;
 	flex-direction: column;
 	height: 70vh;
-	max-height: 640px;
+	max-height: calc(var(--height--5xl) * 6);
 	min-height: 0;
+}
+
+.loading {
+	align-items: center;
+	justify-content: center;
+	gap: var(--spacing--xs);
+}
+
+.embedded {
+	height: 100%;
+	min-height: 0;
+
+	.body {
+		height: min(60dvh, calc(var(--height--5xl) * 5));
+		max-height: 100%;
+	}
+
+	.searchInput {
+		margin-top: 0;
+		margin-bottom: var(--spacing--lg);
+	}
 }
 
 .searchInput {
@@ -379,10 +584,56 @@ function handleOpenChange(value: boolean) {
 	flex-shrink: 0;
 }
 
-// Runs past the dialog's own bottom padding so the list ends at the dialog
-// edge instead of floating above it; rows stay inside the horizontal padding,
-// clear of the rounded corners.
+.createRow {
+	display: flex;
+	align-items: center;
+	gap: var(--spacing--xs);
+	width: 100%;
+	min-height: 58px;
+	margin-top: var(--spacing--sm);
+	padding: var(--spacing--2xs);
+	border: 0;
+	border-radius: var(--radius--2xs);
+	background: none;
+	color: inherit;
+	text-align: left;
+	cursor: pointer;
+	flex-shrink: 0;
+
+	&:hover:not(:disabled) {
+		background: var(--color--background--light-1);
+	}
+
+	&:focus-visible {
+		outline: var(--focus--border-width) solid var(--focus--border-color);
+		outline-offset: 2px;
+	}
+
+	&:disabled {
+		cursor: default;
+	}
+}
+
+.createIcon {
+	flex-shrink: 0;
+	width: 32px;
+	height: 32px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	color: var(--color--primary);
+}
+
+.createText {
+	display: flex;
+	flex-direction: column;
+	gap: var(--spacing--5xs);
+	min-width: 0;
+}
+
 .listWrapper {
+	display: flex;
+	flex-direction: column;
 	flex: 1 1 0;
 	min-height: 0;
 	overflow: hidden;
@@ -394,11 +645,33 @@ function handleOpenChange(value: boolean) {
 	overflow-y: auto;
 }
 
+.categoryHeader {
+	display: flex;
+	align-items: center;
+	height: 100%;
+	padding-inline: var(--spacing--2xs);
+	border-bottom: 1px solid var(--border-color--subtle);
+	box-sizing: border-box;
+}
+
+.persistentScrollbar {
+	@include scrollbar-mixins.scroll-bar;
+}
+
 .empty {
+	flex: 1;
 	display: flex;
 	align-items: center;
 	justify-content: center;
 	padding: var(--spacing--xl);
 	min-height: 200px;
+}
+
+.suggestionRow {
+	width: 100%;
+
+	&:has(*) {
+		margin-top: var(--spacing--sm);
+	}
 }
 </style>

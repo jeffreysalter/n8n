@@ -1,7 +1,7 @@
 /**
  * Replays expression resolution for a node's parameters against a past
  * execution's saved data — the server-side equivalent of the editor's
- * "resolved parameters" view. Used by `executions(action="get-resolved-node-parameters")`
+ * "resolved parameters" view. Used by `workflow_builder_executions(action="get-resolved-node-parameters")`
  * and folded into the `debug` action's failedNode payload.
  *
  * Lives in its own module to keep `instance-ai.adapter.service.ts` focused.
@@ -13,6 +13,7 @@ import {
 	type ResolvedExpressionFailure,
 	type ResolvedNodeParametersResult,
 } from '@n8n/instance-ai';
+import { getErrorMessage } from '@n8n/utils/errors/get-error-message';
 import {
 	type IExecuteData,
 	type INode,
@@ -335,7 +336,7 @@ export async function extractResolvedNodeParameters(
 				}
 				return capResolvedLeaf(resolvedValue);
 			} catch (error) {
-				const errorMessage = error instanceof Error ? error.message : String(error);
+				const errorMessage = getErrorMessage(error);
 				failedExpressions.push({
 					path,
 					raw: value,

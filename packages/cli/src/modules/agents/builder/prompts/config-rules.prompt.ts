@@ -1,8 +1,7 @@
+import { zodSchemaToJsonSchema } from '@n8n/ai-utilities/json-schema';
 import { AgentJsonConfigBaseSchema, AgentModelSchema } from '@n8n/api-types';
-import type { JSONSchema7 } from 'json-schema';
 import type { ZodObject, ZodRawShape } from 'zod';
 import { z } from 'zod';
-import { zodToJsonSchema } from 'zod-to-json-schema';
 
 import { jsonSchemaToCompactText } from '../../json-config/schema-text-serializer';
 
@@ -32,7 +31,6 @@ const BuilderPromptMemoryConfigSchema = z.object({
 			z.object({
 				enabled: z.literal(true),
 				credential: z.string().min(1),
-				extractorModel: BuilderPromptMemoryWorkerModelSchema.optional(),
 				reflectorModel: BuilderPromptMemoryWorkerModelSchema.optional(),
 				topK: z.number().int().min(1).max(100).optional(),
 				maxEntriesPerRun: z.number().int().min(1).max(50).optional(),
@@ -50,7 +48,7 @@ export function getConfigRulesSection(): string {
 #### Agent Config Rules
 
 - \`model\` must be "provider/model-name", or \`""\` while LLM setup is pending.
-- A non-empty \`credential\` must be the id returned by \`resolve_llm\`.
+- A non-empty \`credential\` must be the id returned by \`agent_builder_resolve_llm\`.
 - Sub-agent configuration lives at top level under \`subAgents\`. Load
   \`agent-builder-sub-agents\` before adding refs or changing
   \`subAgents.maxChildren\`.
@@ -64,12 +62,12 @@ export function getConfigRulesSection(): string {
 - \`config.maxIterations\` caps the number of agent loop iterations per run. Do not set or change this unless the user explicitly asks.
 - Fresh agents need real \`instructions\` before config is written. \`model\`
   may be \`""\` and \`credential\` omitted in a draft while LLM setup is
-  pending; fill both from a \`resolve_llm\` result before publishing.`;
+  pending; fill both from a \`agent_builder_resolve_llm\` result before publishing.`;
 }
 
 export function getSchemaReferenceSection(): string {
 	const zodSchema: ZodObject<ZodRawShape> = BuilderPromptAgentJsonConfigSchema;
-	const jsonSchemaText = jsonSchemaToCompactText(zodToJsonSchema(zodSchema) as JSONSchema7);
+	const jsonSchemaText = jsonSchemaToCompactText(zodSchemaToJsonSchema(zodSchema));
 	return `\
 #### Config Schema Reference
 

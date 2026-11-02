@@ -1,4 +1,3 @@
-import type { RedactionOptions } from '@n8n/agents';
 import type { InstanceAiEvent } from '@n8n/api-types';
 
 import type { InstanceAiEventBus } from '../event-bus';
@@ -15,6 +14,7 @@ import {
 } from './resumable-stream-executor';
 import type { RunTokenUsage } from '../stream/usage-accumulator';
 import type { WorkSummary } from '../stream/work-summary-accumulator';
+import { emitBuilderMetric } from '../tracing/builder-metric-event';
 import { resumeAgentStream } from '../utils/stream-helpers';
 import type { SuspensionInfo } from '../utils/stream-helpers';
 
@@ -31,8 +31,6 @@ export interface StreamRunOptions {
 	logger: Logger;
 	onActivity?: () => void;
 	stopSignal?: () => OrchestratorRunStopSignal | undefined;
-	/** Output-redaction policy: omit for the safe default, or `false` to disable. */
-	outputRedaction?: RedactionOptions | false;
 }
 
 export interface StreamRunResult {
@@ -56,7 +54,7 @@ export async function streamAgentRun(
 	const result = await agent.stream(input, streamOptions);
 	const stream = normalizeStreamSource(result);
 	const agentRunId = typeof stream.runId === 'string' ? stream.runId : '';
-	return await consumeStream(agent, stream, { ...options, agentRunId });
+	return await consumeStream(agent, stream, { ...options, agentRunId }, 'message');
 }
 
 export async function resumeAgentRun(
@@ -68,14 +66,16 @@ export async function resumeAgentRun(
 	const resumed = await resumeAgentStream(agent, resumeData, resumeOptions);
 	const stream = normalizeStreamSource(resumed);
 	const agentRunId = (typeof stream.runId === 'string' && stream.runId) || options.agentRunId;
-	return await consumeStream(agent, stream, { ...options, agentRunId });
+	return await consumeStream(agent, stream, { ...options, agentRunId }, 'resume');
 }
 
 async function consumeStream(
 	agent: unknown,
 	stream: ResumableStreamSource,
 	options: StreamRunOptions & { agentRunId: string },
+	phase: 'message' | 'resume',
 ): Promise<StreamRunResult> {
+	let firstResponseRecorded = false;
 	const result = await executeResumableStream({
 		agent,
 		stream,
@@ -87,8 +87,13 @@ async function consumeStream(
 			signal: options.signal,
 			logger: options.logger,
 			onActivity: options.onActivity,
+			onResponseChunk: () => {
+				if (firstResponseRecorded) return;
+				firstResponseRecorded = true;
+				// Not awaited: the span must not delay the first chunk for the user.
+				void emitBuilderMetric(undefined, 'first_response', { success: true, phase });
+			},
 			stopSignal: options.stopSignal,
-			outputRedaction: options.outputRedaction,
 		},
 		control: { mode: 'manual' },
 		initialAgentRunId: options.agentRunId,

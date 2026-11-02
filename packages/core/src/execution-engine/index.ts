@@ -7,6 +7,7 @@ import type {
 	INode,
 	IWorkflowSettings,
 	OauthJweProxyProvider,
+	TrustedSourceDirectory,
 } from 'n8n-workflow';
 
 import type { ExecutionLifecycleHooks } from './execution-lifecycle-hooks';
@@ -51,6 +52,7 @@ declare module 'n8n-workflow' {
 		'data-table'?: { dataTableProxyProvider: DataTableProxyProvider };
 		'dynamic-credentials'?: { credentialCheckProxy: DynamicCredentialCheckProxyProvider };
 		'oauth-jwe'?: { oauthJweProxyProvider: OauthJweProxyProvider };
+		'inbound-auth-core'?: { trustedSourceDirectory: TrustedSourceDirectory };
 		// Project ID is currently only added on the additionalData if the user
 		// has data table listing permission for that project. We should consider
 		// that only data tables belonging to their respective projects are shown.
@@ -101,12 +103,14 @@ export * from './node-execution-context';
 export * from './node-execution-context/utils/execution-metadata';
 export { NoOpPollJobManager } from './noop-poll-job-manager';
 export * from './partial-execution-utils';
+export { commitStagedCursor, runPollInStagingScope } from './poll-cursor-hooks';
 export { PollJobManager } from './poll-job-manager';
 export { PollTriggerExecutor } from './poll-trigger-executor';
 export { isEngineRequest } from './requests-response';
 export * from './routing-node';
 export * from './scheduled-task-manager';
 export { TriggersAndPollers } from './triggers-and-pollers';
+export type { PollErrorKind, PollTickEventMap } from './triggers-and-pollers';
 export * from './workflow-execute';
 // Exposed so eval-mode credential helpers (e.g. `EvalMockedCredentialsHelper`)
 // can reuse the same schema-driven cred synthesizer the wire-server URL

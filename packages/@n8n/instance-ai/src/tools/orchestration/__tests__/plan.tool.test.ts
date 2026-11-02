@@ -1,6 +1,5 @@
-import { executeTool } from '../../../__tests__/tool-test-utils';
+import { executeTool, parseToolInput } from '../../../__tests__/tool-test-utils';
 import { PlanValidationError } from '../../../planned-tasks/planned-task-service';
-import { createToolRegistry } from '../../../tool-registry';
 import type { OrchestrationContext, PlannedTaskService, TaskStorage } from '../../../types';
 import { createPlanTool } from '../plan.tool';
 
@@ -25,13 +24,8 @@ function createMockContext(overrides: Partial<OrchestrationContext> = {}): Orche
 		eventBus: {
 			publish: vi.fn(),
 			subscribe: vi.fn(),
-			getEventsAfter: vi.fn(),
-			getNextEventId: vi.fn(),
-			getEventsForRun: vi.fn().mockReturnValue([]),
-			getEventsForRuns: vi.fn().mockReturnValue([]),
 		},
 		logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
-		domainTools: createToolRegistry(),
 		abortSignal: new AbortController().signal,
 		taskStorage: {
 			get: vi.fn(),
@@ -82,12 +76,12 @@ describe('createPlanTool — planning context guard', () => {
 		const out = await executeTool(tool, { tasks: validTasks() }, {});
 
 		expect(out.taskCount).toBe(0);
-		expect(out.result).toContain('`create-tasks` requires `planningContext`');
+		expect(out.result).toContain('`workflow_builder_create_tasks` requires `planningContext`');
 		expect(out.result).toContain('load the `planning` skill');
 		expect(out.result).not.toContain('`plan`');
 		expect(out.result).not.toContain('skipPlannerDiscovery');
 		expect(context.logger.warn).toHaveBeenCalledWith(
-			'create-tasks called with invalid planning context — rejecting',
+			'workflow_builder_create_tasks called with invalid planning context — rejecting',
 			expect.objectContaining({ threadId: 'test-thread', taskCount: 1 }),
 		);
 		expect(context.plannedTaskService!.createPlan).not.toHaveBeenCalled();
@@ -260,7 +254,7 @@ describe('createPlanTool — planning context guard', () => {
 
 		expect(out.taskCount).toBe(0);
 		expect(out.result).toContain(
-			'must load `create-tasks` via `load_tool` if needed, then call `create-tasks`',
+			'must load `workflow_builder_create_tasks` via `load_tool` if needed, then call `workflow_builder_create_tasks`',
 		);
 		expect(context.plannedTaskService!.createPlan).not.toHaveBeenCalled();
 	});
@@ -461,7 +455,7 @@ describe('createPlanTool — createPlan validation failures', () => {
 		expect(out.result).toContain('Revise the task graph and call this tool again');
 		expect(suspend).not.toHaveBeenCalled();
 		expect(context.logger.warn).toHaveBeenCalledWith(
-			'create-tasks rejected by planned task validator',
+			'workflow_builder_create_tasks rejected by planned task validator',
 			expect.objectContaining({ threadId: 'test-thread', error: validatorError.message }),
 		);
 	});
@@ -481,5 +475,40 @@ describe('createPlanTool — createPlan validation failures', () => {
 				suspend: vi.fn(),
 			}),
 		).rejects.toBe(storageError);
+	});
+});
+
+describe('createPlanTool — task title contract', () => {
+	it('accepts a task with a title', () => {
+		const tool = createPlanTool(createMockContext());
+
+		const parsed = parseToolInput(tool, planInput());
+
+		expect(parsed.success).toBe(true);
+	});
+
+	it('rejects a task whose title is blank', () => {
+		const tool = createPlanTool(createMockContext());
+
+		const parsed = parseToolInput(tool, {
+			...planInput(),
+			tasks: [{ ...validTasks()[0], title: '   ' }],
+		});
+
+		expect(parsed.success).toBe(false);
+	});
+
+	it('trims surrounding whitespace off the title', () => {
+		const tool = createPlanTool(createMockContext());
+
+		const parsed = parseToolInput(tool, {
+			...planInput(),
+			tasks: [{ ...validTasks()[0], title: '\nBuild Slack notifier\n' }],
+		});
+
+		expect(parsed.success).toBe(true);
+		expect(parsed.success && parsed.data).toMatchObject({
+			tasks: [{ title: 'Build Slack notifier' }],
+		});
 	});
 });

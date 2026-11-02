@@ -94,7 +94,6 @@ describe('FormTrigger', () => {
 			expect(requireExecuteAccess).toMatchObject({
 				type: 'boolean',
 				default: false,
-				envFeatureFlag: 'FORM_TRIGGER_OAUTH2',
 			});
 		});
 
@@ -112,6 +111,49 @@ describe('FormTrigger', () => {
 					NodeHelpers.displayParameter(
 						{ [FORM_TRIGGER_AUTHENTICATION_PROPERTY]: authentication },
 						requireExecuteAccess as INodeProperties,
+						{ typeVersion },
+						formTriggerV2.description,
+					),
+				).toBe(shown);
+			},
+		);
+	});
+
+	describe('trustedSource', () => {
+		const formTriggerV2 = new FormTriggerV2({
+			displayName: 'n8n Form Trigger',
+			name: 'formTrigger',
+			group: ['trigger'],
+			description: 'Generate webforms in n8n and pass their responses to the workflow',
+			defaultVersion: 2.6,
+		});
+
+		const trustedSource = formTriggerV2.description.properties.find(
+			(property) => property.name === 'trustedSource',
+		);
+
+		it("should default to the instance's own OAuth2 server, loaded from the directory", () => {
+			expect(trustedSource).toMatchObject({
+				type: 'options',
+				default: 'n8n-internal',
+				typeOptions: { loadOptionsMethod: 'listTrustedSources' },
+			});
+			expect(formTriggerV2.methods.loadOptions.listTrustedSources).toBeDefined();
+		});
+
+		it.each<[string, number, boolean]>([
+			['n8nUserAuth', 2.6, true],
+			['none', 2.6, false],
+			['basicAuth', 2.6, false],
+			['n8nUserAuth', 2.5, false],
+		])(
+			'should be shown for authentication %s on typeVersion %s: %s',
+			(authentication, typeVersion, shown) => {
+				expect(trustedSource).toBeDefined();
+				expect(
+					NodeHelpers.displayParameter(
+						{ [FORM_TRIGGER_AUTHENTICATION_PROPERTY]: authentication },
+						trustedSource as INodeProperties,
 						{ typeVersion },
 						formTriggerV2.description,
 					),
